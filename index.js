@@ -3,6 +3,8 @@ import express from 'express';
 import cors from 'cors';
 import { v4 as uuidv4 } from 'uuid';
 import dotenv from 'dotenv';
+import { createServer } from 'http';
+import { Server } from 'socket.io';
 
 // Load environment variables
 dotenv.config();
@@ -20,13 +22,88 @@ const MQTT_TOPICS = {
 
 // Initialize Express app
 const app = express();
-app.use(cors());
+const httpServer = createServer(app);
+
+// Initialize Socket.IO with CORS
+const io = new Server(httpServer, {
+  cors: {
+    origin: process.env.ALLOWED_ORIGINS 
+      ? process.env.ALLOWED_ORIGINS.split(',')
+      : [
+          'http://localhost:3001',
+          'http://localhost:3000',
+          'http://localhost:5173',
+          'http://localhost:5174',
+          'http://127.0.0.1:5173',
+          'http://127.0.0.1:5174',
+          'https://subtronic-frontend.vercel.app',
+          'https://*.vercel.app'
+        ],
+    credentials: true,
+    methods: ['GET', 'POST']
+  },
+  transports: ['websocket', 'polling']
+});
+
+// CORS configuration to allow both local and Vercel frontend
+const allowedOrigins = process.env.ALLOWED_ORIGINS 
+  ? process.env.ALLOWED_ORIGINS.split(',')
+  : [
+      'http://localhost:3001',
+      'http://localhost:3000',
+      'http://localhost:5173',
+      'http://localhost:5174',
+      'http://127.0.0.1:5173',
+      'http://127.0.0.1:5174',
+      'https://subtronic-frontend.vercel.app'
+    ];
+
+const corsOptions = {
+  origin: allowedOrigins,
+  credentials: true,
+  optionsSuccessStatus: 200
+};
+
+app.use(cors(corsOptions));
 app.use(express.json());
 
 // Device data storage (in-memory for simplicity)
 const deviceData = new Map();
 const pendingCommands = new Map();
 const subtronicsData = new Map(); // Store Subtronics Gas Monitor data
+
+// WebSocket connection tracking
+let connectedClients = 0;
+
+// Socket.IO connection handler
+io.on('connection', (socket) => {
+  connectedClients++;
+  console.log(`🔌 Client connected (ID: ${socket.id}) - Total clients: ${connectedClients}`);
+  
+  // Send current data to newly connected client
+  socket.on('subscribe:device', (deviceId) => {
+    console.log(`📡 Client ${socket.id} subscribed to device ${deviceId}`);
+    socket.join(`device:${deviceId}`);
+    
+    // Send current data immediately
+    if (subtronicsData.has(deviceId)) {
+      socket.emit('device:data', {
+        deviceId,
+        data: subtronicsData.get(deviceId)
+      });
+    }
+  });
+  
+  socket.on('unsubscribe:device', (deviceId) => {
+    console.log(`📡 Client ${socket.id} unsubscribed from device ${deviceId}`);
+    socket.leave(`device:${deviceId}`);
+  });
+  
+  socket.on('disconnect', () => {
+    connectedClients--;
+    console.log(`🔌 Client disconnected (ID: ${socket.id}) - Total clients: ${connectedClients}`);
+  });
+});
 
 // Initialize MQTT client (optional - will work without MQTT broker)
 let mqttClient = null;
@@ -261,6 +338,15 @@ if (mqttClient) {
           // Store normalized data
           subtronicsData.set(deviceId, normalized);
           
+          // Broadcast to all connected WebSocket clients subscribed to this device
+          io.to(`device:${deviceId}`).emit('device:data', {
+            deviceId,
+            data: normalized,
+            timestamp: new Date().toISOString()
+          });
+          
+          console.log(`💾 Stored and broadcasted Subtronics data for device ${deviceId} to ${connectedClients} clients`);
+          
           // Generate alerts
           const alerts = generateSubtronicsAlerts(normalized);
           if (alerts.length > 0) {
@@ -268,9 +354,13 @@ if (mqttClient) {
             // Store alerts (in production, this would go to a database)
             const existingAlerts = subtronicsData.get(`${deviceId}_alerts`) || [];
             subtronicsData.set(`${deviceId}_alerts`, [...existingAlerts, ...alerts]);
+            
+            // Broadcast alerts
+            io.to(`device:${deviceId}`).emit('device:alerts', {
+              deviceId,
+              alerts
+            });
           }
-          
-          console.log(`💾 Stored Subtronics data for device ${deviceId}`);
         }
         return;
       }
@@ -498,7 +588,27 @@ app.get('/health', (req, res) => {
     devices_count: deviceData.size,
     subtronics_devices: subtronicsData.size,
     pending_commands: pendingCommands.size,
+    allowed_origins: allowedOrigins,
     timestamp: new Date().toISOString()
+  });
+});
+
+// Frontend configuration endpoint
+app.get('/config', (req, res) => {
+  res.json({
+    api_base_url: `http://localhost:${HTTP_PORT}`,
+    mqtt_broker: MQTT_BROKER,
+    mqtt_topics: MQTT_TOPICS,
+    frontend_urls: [
+      'http://localhost:3001',
+      'https://subtronic-frontend.vercel.app'
+    ],
+    endpoints: {
+      health: '/health',
+      subtronics_telemetry: '/devices/{deviceId}/subtronics/telemetry/latest',
+      subtronics_alerts: '/devices/{deviceId}/subtronics/alerts',
+      test_publish: '/test/subtronics/{deviceId}'
+    }
   });
 });
 
@@ -558,10 +668,11 @@ app.post('/test/subtronics/:deviceId', (req, res) => {
 });
 
 // Start HTTP server
-app.listen(HTTP_PORT, () => {
+httpServer.listen(HTTP_PORT, () => {
   console.log(`🚀 Subtronic MQTT Backend running on port ${HTTP_PORT}`);
   console.log(`📡 MQTT Broker: ${MQTT_BROKER}`);
   console.log(`🔗 API Base: http://localhost:${HTTP_PORT}`);
+  console.log(`🔌 WebSocket: ws://localhost:${HTTP_PORT}`);
   console.log(`🧪 Test Subtronics: POST http://localhost:${HTTP_PORT}/test/subtronics/123`);
   console.log(`📊 Subtronics API: GET http://localhost:${HTTP_PORT}/devices/123/subtronics/telemetry/latest`);
 });
@@ -569,16 +680,28 @@ app.listen(HTTP_PORT, () => {
 // Graceful shutdown
 process.on('SIGINT', () => {
   console.log('\n🛑 Shutting down gracefully...');
+  io.close(() => {
+    console.log('🔌 WebSocket server closed');
+  });
   if (mqttClient) {
     mqttClient.end();
   }
-  process.exit(0);
+  httpServer.close(() => {
+    console.log('🚪 HTTP server closed');
+    process.exit(0);
+  });
 });
 
 process.on('SIGTERM', () => {
   console.log('\n🛑 Received SIGTERM, shutting down...');
+  io.close(() => {
+    console.log('🔌 WebSocket server closed');
+  });
   if (mqttClient) {
     mqttClient.end();
   }
-  process.exit(0);
+  httpServer.close(() => {
+    console.log('🚪 HTTP server closed');
+    process.exit(0);
+  });
 });

@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: subtronic-backend
+    runtime: node
+    region: oregon
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HTTP_PORT
+        value: 3002
+      - key: MQTT_BROKER
+        sync: false
+      - key: MQTT_USERNAME
+        sync: false
+      - key: MQTT_PASSWORD
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
