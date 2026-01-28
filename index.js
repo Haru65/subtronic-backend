@@ -139,56 +139,80 @@ function parseSubtronicsPayload(rawJson) {
     const deviceName = data["Device Alias Name"] || data["Device Alise Name"] || "Unknown Device";
     const serialNumber = data["OTSM-2 Serial Number"] || "Unknown";
     const gasType = data["Gas"] || "Unknown Gas";
-    const timestamp = data["timestamp"] || new Date().toISOString();
-    const unit = data["Unit of Measurement"] || "ppm";
+    
+    // Handle timestamp - use "Date Time At Reading" or "timestamp"
+    const timestamp = data["Date Time At Reading"] || data["timestamp"] || new Date().toISOString();
+    
     const messageType = data["Message Type"] || "LOG DATA";
     const sender = data["Sender"] || "Device";
-    
-    // Handle sensor reading - use "Sensor Reading" if available, otherwise use Offset as fallback
-    const sensorReading = data["Sensor Reading"] !== undefined 
-      ? parseFloat(data["Sensor Reading"]) 
-      : parseFloat(data["Parameters"]?.["Offset"]) || 0;
-    
-    // Handle alarm status - use "Alarm Status" if available, otherwise derive from LED status
-    let alarmStatus = data["Alarm Status"] || "NORMAL";
-    if (!data["Alarm Status"]) {
-      // Derive alarm status from LED indicators
-      const params = data["Parameters"] || {};
-      const alarm1Led = parseInt(params["Alarm 1 LED Status"]) || 0;
-      const alarm2Led = parseInt(params["Alarm 2 LED Status"]) || 0;
-      const alarm3Led = parseInt(params["Alarm 3 LED Status"]) || 0;
-      const sensorFault = parseInt(params["SensorFault"]) || 0;
-      
-      if (sensorFault === 1 || alarm3Led === 1 || alarm2Led === 1 || alarm1Led === 1) {
-        alarmStatus = "ALARM";
-      } else {
-        alarmStatus = "NORMAL";
-      }
-    }
     
     // Extract parameters
     const params = data["Parameters"] || {};
     
-    // Create normalized payload
+    // Handle unit - can be in Parameters or root level
+    let unit = "ppm";
+    if (params["Unit of Measurement "] !== undefined) {
+      // Map numeric unit codes to text
+      const unitCode = parseInt(params["Unit of Measurement "]);
+      unit = unitCode === 1 ? "ppm" : "ppm"; // Add more mappings as needed
+    } else if (params["Unit of Measurement"] !== undefined) {
+      unit = params["Unit of Measurement"];
+    } else if (data["Unit of Measurement "] !== undefined) {
+      unit = data["Unit of Measurement "];
+    } else if (data["Unit of Measurement"] !== undefined) {
+      unit = data["Unit of Measurement"];
+    }
+    
+    // Handle sensor reading - MAP "Live Sensor Readings " to offset for frontend compatibility
+    // Priority: Live Sensor Readings (with/without space) > Sensor Reading > Offset
+    let gasConcentration = 0;
+    if (params["Live Sensor Readings "] !== undefined) {
+      gasConcentration = parseFloat(params["Live Sensor Readings "]);
+    } else if (params["Live Sensor Readings"] !== undefined) {
+      gasConcentration = parseFloat(params["Live Sensor Readings"]);
+    } else if (data["Sensor Reading"] !== undefined) {
+      gasConcentration = parseFloat(data["Sensor Reading"]);
+    } else if (params["Offset"] !== undefined) {
+      gasConcentration = parseFloat(params["Offset"]);
+    }
+    
+    // Handle alarm status - derive from LED status
+    const alarm1Led = parseInt(params["Alarm 1 LED Status"]) || 0;
+    const alarm2Led = parseInt(params["Alarm 2 LED Status"]) || 0;
+    const alarm3Led = parseInt(params["Alarm 3 LED Status"]) || 0;
+    const sensorFault = parseInt(params["Sensor Fault"]) || parseInt(params["SensorFault"]) || 0;
+    
+    let alarmStatus = "NORMAL";
+    if (sensorFault === 1 || alarm3Led === 1 || alarm2Led === 1 || alarm1Led === 1) {
+      alarmStatus = "ALARM";
+    }
+    
+    // Handle location - can be in Parameters or root level
+    const latitude = data["lat"] || params["lat"] || "0.00";
+    const longitude = data["long"] || params["long"] || "0.00";
+    
+    // Create normalized payload - MAP Live Sensor Readings to "offset" field
     const normalized = {
       // Device Info
       device_name: deviceName,
       serial_number: serialNumber,
       gas_type: gasType,
       timestamp: timestamp,
-      unit: unit.trim(),
+      unit: unit.toString().trim(),
       message_type: messageType,
       sender: sender,
       
-      // Core Readings
-      sensor_reading: sensorReading, // Current gas concentration
+      // Core Readings - IMPORTANT: offset is the gas concentration for frontend
+      sensor_reading: gasConcentration,
+      offset: gasConcentration, // Map Live Sensor Readings to offset for frontend compatibility
       alarm_status: alarmStatus,
-      offset: parseInt(params["Offset"]) || 0,
-      span_high: parseInt(params["Span High"]) || 0,
+      
+      // Span and Alarm Levels
+      span_high: parseInt(params["Span High"]) || 2000,
       span_low: parseInt(params["Span Low"]) || 0,
-      a1_level: parseInt(params["Alarm Level A1"]) || 0,
-      a2_level: parseInt(params["Alarm Level A2"]) || 0,
-      a3_level: parseInt(params["Alarm Level A3"]) || 0,
+      a1_level: parseInt(params["Alarm Level A1"]) || 250,
+      a2_level: parseInt(params["Alarm Level A2"]) || 500,
+      a3_level: parseInt(params["Alarm Level A3"]) || 1000,
       decimal_point: parseInt(params["Decimal Point"]) || 0,
       
       // Alarm Configuration
@@ -199,20 +223,22 @@ function parseSubtronicsPayload(rawJson) {
       a1_buzzer: parseInt(params["A1Buzzer"]) || 0,
       
       // Alarm LED Status
-      alarm1_led: parseInt(params["Alarm 1 LED Status"]) || 0,
-      alarm2_led: parseInt(params["Alarm 2 LED Status"]) || 0,
-      alarm3_led: parseInt(params["Alarm 3 LED Status"]) || 0,
-      sensor_fault: parseInt(params["SensorFault"]) || 0,
+      alarm1_led: alarm1Led,
+      alarm2_led: alarm2Led,
+      alarm3_led: alarm3Led,
+      sensor_fault: sensorFault,
       
       // Location
-      latitude: params["lat"] || "0.00",
-      longitude: params["long"] || "0.00",
+      latitude: latitude,
+      longitude: longitude,
       
       // Metadata
       raw_message: data,
       processed_at: new Date().toISOString(),
       data_quality: 'good'
     };
+    
+    console.log(`📊 Parsed data - Gas Concentration: ${gasConcentration} ${unit} (mapped to offset field)`);
     
     return normalized;
   } catch (error) {
