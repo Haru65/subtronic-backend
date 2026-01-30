@@ -5,9 +5,25 @@ import { v4 as uuidv4 } from 'uuid';
 import dotenv from 'dotenv';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
+import mongoose from 'mongoose';
+import AlarmLog from './models/AlarmLog.js';
 
 // Load environment variables
 dotenv.config();
+
+// MongoDB Connection
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/subtronics_alarms';
+let mongoConnected = false;
+
+mongoose.connect(MONGODB_URI)
+.then(() => {
+  console.log('✅ Connected to MongoDB Atlas');
+  mongoConnected = true;
+})
+.catch((err) => {
+  console.error('❌ MongoDB connection error:', err.message);
+  console.log('⚠️  Running without database - alarms will be stored in memory only');
+});
 
 // Configuration
 const MQTT_BROKER = process.env.MQTT_BROKER || 'mqtt://broker.zeptac.com:1883';
@@ -71,6 +87,7 @@ app.use(express.json());
 const deviceData = new Map();
 const pendingCommands = new Map();
 const subtronicsData = new Map(); // Store Subtronics Gas Monitor data
+const alarmLogs = new Map(); // Store alarm history logs
 
 // WebSocket connection tracking
 let connectedClients = 0;
@@ -239,6 +256,8 @@ function parseSubtronicsPayload(rawJson) {
     };
     
     console.log(`📊 Parsed data - Gas Concentration: ${gasConcentration} ${unit} (mapped to offset field)`);
+    console.log(`   sensor_reading: ${normalized.sensor_reading}, offset: ${normalized.offset}`);
+    console.log(`   Alarm LEDs - A1: ${alarm1Led}, A2: ${alarm2Led}, A3: ${alarm3Led}, Fault: ${sensorFault}`);
     
     return normalized;
   } catch (error) {
@@ -248,62 +267,151 @@ function parseSubtronicsPayload(rawJson) {
 }
 
 /**
+ * Log alarm event to persistent storage (MongoDB)
+ */
+async function logAlarmEvent(deviceId, alarmData) {
+  const logEntry = {
+    device_id: deviceId,
+    device_name: alarmData.device_name,
+    serial_number: alarmData.serial_number,
+    alarm_type: alarmData.type,
+    severity: alarmData.severity,
+    message: alarmData.message,
+    threshold: alarmData.threshold,
+    current_value: alarmData.current_value,
+    unit: alarmData.unit,
+    gas_type: alarmData.gas_type,
+    timestamp: new Date(alarmData.timestamp),
+    acknowledged: false,
+    acknowledged_at: null,
+    acknowledged_by: null
+  };
+  
+  try {
+    // Save to MongoDB if connected
+    if (mongoConnected) {
+      const savedLog = await AlarmLog.create(logEntry);
+      console.log(`📝 Logged alarm to MongoDB: ${alarmData.type} for device ${deviceId} (ID: ${savedLog._id})`);
+      return savedLog;
+    } else {
+      // Fallback to in-memory storage
+      const deviceLogs = alarmLogs.get(deviceId) || [];
+      logEntry.id = `log_${deviceId}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      deviceLogs.push(logEntry);
+      
+      // Keep only last 1000 logs per device to prevent memory issues
+      if (deviceLogs.length > 1000) {
+        deviceLogs.shift();
+      }
+      
+      alarmLogs.set(deviceId, deviceLogs);
+      console.log(`📝 Logged alarm to memory: ${alarmData.type} for device ${deviceId}`);
+      return logEntry;
+    }
+  } catch (error) {
+    console.error('❌ Error logging alarm:', error);
+    // Fallback to in-memory on error
+    const deviceLogs = alarmLogs.get(deviceId) || [];
+    logEntry.id = `log_${deviceId}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    deviceLogs.push(logEntry);
+    alarmLogs.set(deviceId, deviceLogs);
+    return logEntry;
+  }
+}
+
+/**
  * Generate alerts based on Subtronics data
+ * Checks both LED status AND actual sensor readings vs thresholds
  */
 function generateSubtronicsAlerts(data) {
   const alerts = [];
   
   // Check sensor fault
   if (data.sensor_fault === 1) {
-    alerts.push({
+    const alert = {
       id: `fault_${data.serial_number}_${Date.now()}`,
       type: 'sensor_fault',
       severity: 'critical',
       message: 'Sensor fault detected',
       timestamp: new Date().toISOString(),
       device_name: data.device_name,
-      serial_number: data.serial_number
-    });
-  }
-  
-  // Check alarm LED status
-  if (data.alarm1_led === 1) {
-    alerts.push({
-      id: `alarm1_${data.serial_number}_${Date.now()}`,
-      type: 'alarm_level_1',
-      severity: 'warning',
-      message: `Gas concentration above A1 threshold (${data.a1_level} ${data.unit})`,
-      timestamp: new Date().toISOString(),
-      device_name: data.device_name,
       serial_number: data.serial_number,
-      threshold: data.a1_level
-    });
+      current_value: data.sensor_reading,
+      unit: data.unit,
+      gas_type: data.gas_type
+    };
+    alerts.push(alert);
+    
+    // Log the alarm event
+    logAlarmEvent(data.serial_number, alert);
   }
   
-  if (data.alarm2_led === 1) {
-    alerts.push({
-      id: `alarm2_${data.serial_number}_${Date.now()}`,
-      type: 'alarm_level_2',
-      severity: 'high',
-      message: `Gas concentration above A2 threshold (${data.a2_level} ${data.unit})`,
-      timestamp: new Date().toISOString(),
-      device_name: data.device_name,
-      serial_number: data.serial_number,
-      threshold: data.a2_level
-    });
-  }
+  // Check if sensor reading exceeds thresholds (regardless of LED status)
+  const sensorReading = parseFloat(data.sensor_reading) || 0;
+  const a1Level = parseFloat(data.a1_level) || 250;
+  const a2Level = parseFloat(data.a2_level) || 500;
+  const a3Level = parseFloat(data.a3_level) || 1000;
   
-  if (data.alarm3_led === 1) {
-    alerts.push({
+  console.log(`🔍 Checking thresholds: Reading=${sensorReading}, A1=${a1Level}, A2=${a2Level}, A3=${a3Level}`);
+  
+  // Check A3 first (highest priority)
+  if (sensorReading >= a3Level) {
+    const alert = {
       id: `alarm3_${data.serial_number}_${Date.now()}`,
       type: 'alarm_level_3',
       severity: 'critical',
-      message: `Gas concentration above A3 threshold (${data.a3_level} ${data.unit})`,
+      message: `Gas concentration above A3 threshold (${a3Level} ${data.unit})`,
       timestamp: new Date().toISOString(),
       device_name: data.device_name,
       serial_number: data.serial_number,
-      threshold: data.a3_level
-    });
+      threshold: a3Level,
+      current_value: sensorReading,
+      unit: data.unit,
+      gas_type: data.gas_type
+    };
+    alerts.push(alert);
+    console.log(`🚨 A3 Alarm: ${sensorReading} ${data.unit} >= ${a3Level} ${data.unit}`);
+    logAlarmEvent(data.serial_number, alert);
+  }
+  // Check A2 (medium priority)
+  else if (sensorReading >= a2Level) {
+    const alert = {
+      id: `alarm2_${data.serial_number}_${Date.now()}`,
+      type: 'alarm_level_2',
+      severity: 'high',
+      message: `Gas concentration above A2 threshold (${a2Level} ${data.unit})`,
+      timestamp: new Date().toISOString(),
+      device_name: data.device_name,
+      serial_number: data.serial_number,
+      threshold: a2Level,
+      current_value: sensorReading,
+      unit: data.unit,
+      gas_type: data.gas_type
+    };
+    alerts.push(alert);
+    console.log(`🚨 A2 Alarm: ${sensorReading} ${data.unit} >= ${a2Level} ${data.unit}`);
+    logAlarmEvent(data.serial_number, alert);
+  }
+  // Check A1 (low priority)
+  else if (sensorReading >= a1Level) {
+    const alert = {
+      id: `alarm1_${data.serial_number}_${Date.now()}`,
+      type: 'alarm_level_1',
+      severity: 'warning',
+      message: `Gas concentration above A1 threshold (${a1Level} ${data.unit})`,
+      timestamp: new Date().toISOString(),
+      device_name: data.device_name,
+      serial_number: data.serial_number,
+      threshold: a1Level,
+      current_value: sensorReading,
+      unit: data.unit,
+      gas_type: data.gas_type
+    };
+    alerts.push(alert);
+    console.log(`🚨 A1 Alarm: ${sensorReading} ${data.unit} >= ${a1Level} ${data.unit}`);
+    logAlarmEvent(data.serial_number, alert);
+  } else {
+    console.log(`✅ No alarm: ${sensorReading} ${data.unit} is below A1 threshold (${a1Level} ${data.unit})`);
   }
   
   return alerts;
@@ -491,6 +599,236 @@ app.get('/devices/:deviceId/subtronics/alerts', (req, res) => {
   console.log(`📤 Sent ${alerts.length} alerts for device ${deviceId}`);
 });
 
+// Get alarm logs (history) for a device
+app.get('/devices/:deviceId/alarm-logs', async (req, res) => {
+  const { deviceId } = req.params;
+  const { start_date, end_date, alarm_type, severity, limit = 100 } = req.query;
+  
+  try {
+    if (mongoConnected) {
+      // Query MongoDB
+      const query = { device_id: deviceId };
+      
+      // Filter by date range
+      if (start_date || end_date) {
+        query.timestamp = {};
+        if (start_date) query.timestamp.$gte = new Date(start_date);
+        if (end_date) query.timestamp.$lte = new Date(end_date);
+      }
+      
+      // Filter by alarm type
+      if (alarm_type) query.alarm_type = alarm_type;
+      
+      // Filter by severity
+      if (severity) query.severity = severity;
+      
+      const logs = await AlarmLog.find(query)
+        .sort({ timestamp: -1 })
+        .limit(parseInt(limit))
+        .lean();
+      
+      res.json({
+        device_id: deviceId,
+        total_count: logs.length,
+        logs: logs
+      });
+      
+      console.log(`📤 Sent ${logs.length} alarm logs for device ${deviceId} from MongoDB`);
+    } else {
+      // Fallback to in-memory
+      let logs = alarmLogs.get(deviceId) || [];
+      
+      // Apply filters (same as before)
+      if (start_date) {
+        const startTime = new Date(start_date).getTime();
+        logs = logs.filter(log => new Date(log.timestamp).getTime() >= startTime);
+      }
+      
+      if (end_date) {
+        const endTime = new Date(end_date).getTime();
+        logs = logs.filter(log => new Date(log.timestamp).getTime() <= endTime);
+      }
+      
+      if (alarm_type) logs = logs.filter(log => log.alarm_type === alarm_type);
+      if (severity) logs = logs.filter(log => log.severity === severity);
+      
+      logs.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+      logs = logs.slice(0, parseInt(limit));
+      
+      res.json({
+        device_id: deviceId,
+        total_count: logs.length,
+        logs: logs
+      });
+      
+      console.log(`📤 Sent ${logs.length} alarm logs for device ${deviceId} from memory`);
+    }
+  } catch (error) {
+    console.error('❌ Error fetching alarm logs:', error);
+    res.status(500).json({ error: 'Failed to fetch alarm logs', details: error.message });
+  }
+});
+
+// Get alarm logs for all devices
+app.get('/alarm-logs', async (req, res) => {
+  const { start_date, end_date, alarm_type, severity, device_id, limit = 100 } = req.query;
+  
+  try {
+    if (mongoConnected) {
+      // Query MongoDB
+      const query = {};
+      
+      // Filter by device
+      if (device_id) query.device_id = device_id;
+      
+      // Filter by date range
+      if (start_date || end_date) {
+        query.timestamp = {};
+        if (start_date) query.timestamp.$gte = new Date(start_date);
+        if (end_date) query.timestamp.$lte = new Date(end_date);
+      }
+      
+      // Filter by alarm type
+      if (alarm_type) query.alarm_type = alarm_type;
+      
+      // Filter by severity
+      if (severity) query.severity = severity;
+      
+      const logs = await AlarmLog.find(query)
+        .sort({ timestamp: -1 })
+        .limit(parseInt(limit))
+        .lean();
+      
+      res.json({
+        total_count: logs.length,
+        logs: logs
+      });
+      
+      console.log(`📤 Sent ${logs.length} alarm logs from MongoDB`);
+    } else {
+      // Fallback to in-memory
+      let allLogs = [];
+      for (const [deviceId, logs] of alarmLogs.entries()) {
+        allLogs = allLogs.concat(logs);
+      }
+      
+      // Apply filters
+      if (device_id) allLogs = allLogs.filter(log => log.device_id === device_id);
+      
+      if (start_date) {
+        const startTime = new Date(start_date).getTime();
+        allLogs = allLogs.filter(log => new Date(log.timestamp).getTime() >= startTime);
+      }
+      
+      if (end_date) {
+        const endTime = new Date(end_date).getTime();
+        allLogs = allLogs.filter(log => new Date(log.timestamp).getTime() <= endTime);
+      }
+      
+      if (alarm_type) allLogs = allLogs.filter(log => log.alarm_type === alarm_type);
+      if (severity) allLogs = allLogs.filter(log => log.severity === severity);
+      
+      allLogs.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+      allLogs = allLogs.slice(0, parseInt(limit));
+      
+      res.json({
+        total_count: allLogs.length,
+        logs: allLogs
+      });
+      
+      console.log(`📤 Sent ${allLogs.length} alarm logs from memory`);
+    }
+  } catch (error) {
+    console.error('❌ Error fetching alarm logs:', error);
+    res.status(500).json({ error: 'Failed to fetch alarm logs', details: error.message });
+  }
+});
+
+// Get alarm statistics
+app.get('/alarm-logs/statistics', async (req, res) => {
+  const { start_date, end_date, device_id } = req.query;
+  
+  try {
+    if (mongoConnected) {
+      // Query MongoDB
+      const query = {};
+      
+      if (device_id) query.device_id = device_id;
+      
+      if (start_date || end_date) {
+        query.timestamp = {};
+        if (start_date) query.timestamp.$gte = new Date(start_date);
+        if (end_date) query.timestamp.$lte = new Date(end_date);
+      }
+      
+      const logs = await AlarmLog.find(query).lean();
+      
+      // Calculate statistics
+      const stats = {
+        total_alarms: logs.length,
+        by_type: {},
+        by_severity: {},
+        by_device: {},
+        acknowledged_count: logs.filter(log => log.acknowledged).length,
+        unacknowledged_count: logs.filter(log => !log.acknowledged).length
+      };
+      
+      logs.forEach(log => {
+        stats.by_type[log.alarm_type] = (stats.by_type[log.alarm_type] || 0) + 1;
+        stats.by_severity[log.severity] = (stats.by_severity[log.severity] || 0) + 1;
+        stats.by_device[log.device_id] = (stats.by_device[log.device_id] || 0) + 1;
+      });
+      
+      res.json(stats);
+      console.log(`📤 Sent alarm statistics from MongoDB`);
+    } else {
+      // Fallback to in-memory
+      let allLogs = [];
+      
+      if (device_id) {
+        allLogs = alarmLogs.get(device_id) || [];
+      } else {
+        for (const [deviceId, logs] of alarmLogs.entries()) {
+          allLogs = allLogs.concat(logs);
+        }
+      }
+      
+      // Filter by date range
+      if (start_date) {
+        const startTime = new Date(start_date).getTime();
+        allLogs = allLogs.filter(log => new Date(log.timestamp).getTime() >= startTime);
+      }
+      
+      if (end_date) {
+        const endTime = new Date(end_date).getTime();
+        allLogs = allLogs.filter(log => new Date(log.timestamp).getTime() <= endTime);
+      }
+      
+      // Calculate statistics
+      const stats = {
+        total_alarms: allLogs.length,
+        by_type: {},
+        by_severity: {},
+        by_device: {},
+        acknowledged_count: allLogs.filter(log => log.acknowledged).length,
+        unacknowledged_count: allLogs.filter(log => !log.acknowledged).length
+      };
+      
+      allLogs.forEach(log => {
+        stats.by_type[log.alarm_type] = (stats.by_type[log.alarm_type] || 0) + 1;
+        stats.by_severity[log.severity] = (stats.by_severity[log.severity] || 0) + 1;
+        stats.by_device[log.device_id] = (stats.by_device[log.device_id] || 0) + 1;
+      });
+      
+      res.json(stats);
+      console.log(`📤 Sent alarm statistics from memory`);
+    }
+  } catch (error) {
+    console.error('❌ Error fetching alarm statistics:', error);
+    res.status(500).json({ error: 'Failed to fetch statistics', details: error.message });
+  }
+});
+
 // Acknowledge Subtronics alert
 app.post('/devices/:deviceId/subtronics/alerts/:alertId/acknowledge', (req, res) => {
   const { deviceId, alertId } = req.params;
@@ -611,6 +949,7 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'healthy',
     mqtt_connected: mqttConnected,
+    mongodb_connected: mongoConnected,
     devices_count: deviceData.size,
     subtronics_devices: subtronicsData.size,
     pending_commands: pendingCommands.size,
@@ -626,7 +965,7 @@ app.get('/config', (req, res) => {
     mqtt_broker: MQTT_BROKER,
     mqtt_topics: MQTT_TOPICS,
     frontend_urls: [
-      'http://localhost:3001',
+      'http://localhost:3000',
       'https://subtronic-frontend.vercel.app'
     ],
     endpoints: {
@@ -642,16 +981,17 @@ app.get('/config', (req, res) => {
 app.post('/test/subtronics/:deviceId', (req, res) => {
   const { deviceId } = req.params;
   
-  const mockPayload = {
+  // Use provided data or generate mock data
+  const mockPayload = req.body || {
     "Device Alise Name": "Gas Sensor Block1",
-    "OTSM-2 Serial Number": "OTSM-0114",
+    "OTSM-2 Serial Number": deviceId,
     "Gas": "Carbon Monoxide (CO)",
     "timestamp": new Date().toISOString(),
     "Sender": "Device",
     "Message Type": "LOG DATA",
     "Unit of Measurement ": " ppm",
     "Parameters": {
-      "Offset": 0,
+      "Live Sensor Readings ": Math.floor(Math.random() * 1500),
       "Span High": 2000,
       "Span Low": 0,
       "Alarm Level A1": 250,
@@ -667,28 +1007,71 @@ app.post('/test/subtronics/:deviceId', (req, res) => {
       "Alarm 2 LED Status": Math.random() > 0.9 ? 1 : 0,
       "Alarm 3 LED Status": Math.random() > 0.95 ? 1 : 0,
       "SensorFault": Math.random() > 0.98 ? 1 : 0,
-      "lat": "40.7128",
-      "long": "-74.0060"
+      "lat": "19.0760",
+      "long": "72.8777"
     }
   };
   
   const topic = `SubTronics/data`;
+  
+  // Process data directly (simulate MQTT message handling)
+  try {
+    const normalized = parseSubtronicsPayload(mockPayload);
+    
+    if (normalized) {
+      // Use serial number as device ID
+      const processedDeviceId = normalized.serial_number;
+      
+      // Store normalized data
+      subtronicsData.set(processedDeviceId, normalized);
+      
+      // Broadcast to all connected WebSocket clients subscribed to this device
+      io.to(`device:${processedDeviceId}`).emit('device:data', {
+        deviceId: processedDeviceId,
+        data: normalized,
+        timestamp: new Date().toISOString()
+      });
+      
+      console.log(`💾 Processed test data for device ${processedDeviceId}`);
+      
+      // Generate alerts
+      const alerts = generateSubtronicsAlerts(normalized);
+      if (alerts.length > 0) {
+        console.log(`🚨 Generated ${alerts.length} alerts for device ${processedDeviceId}`);
+        // Store alerts
+        const existingAlerts = subtronicsData.get(`${processedDeviceId}_alerts`) || [];
+        subtronicsData.set(`${processedDeviceId}_alerts`, [...existingAlerts, ...alerts]);
+        
+        // Broadcast alerts
+        io.to(`device:${processedDeviceId}`).emit('device:alerts', {
+          deviceId: processedDeviceId,
+          alerts
+        });
+      }
+      
+      res.json({ 
+        message: 'Test Subtronics data processed successfully', 
+        deviceId: processedDeviceId,
+        data: normalized,
+        alerts: alerts,
+        mqtt_published: false
+      });
+    } else {
+      res.status(400).json({ error: 'Failed to parse payload' });
+    }
+  } catch (error) {
+    console.error('❌ Error processing test data:', error);
+    res.status(500).json({ error: 'Failed to process test data', details: error.message });
+  }
+  
+  // Also try to publish via MQTT if connected
   if (mqttClient && mqttConnected) {
     mqttClient.publish(topic, JSON.stringify(mockPayload), (err) => {
       if (err) {
-        res.status(500).json({ error: 'Failed to publish test data' });
+        console.error('❌ Failed to publish to MQTT:', err);
       } else {
-        res.json({ 
-          message: 'Test Subtronics data published', 
-          topic, 
-          data: mockPayload 
-        });
+        console.log(`📤 Also published to MQTT topic: ${topic}`);
       }
-    });
-  } else {
-    res.status(503).json({ 
-      error: 'MQTT not connected', 
-      message: 'Cannot publish test data without MQTT connection' 
     });
   }
 });
@@ -704,7 +1087,7 @@ httpServer.listen(HTTP_PORT, () => {
 });
 
 // Graceful shutdown
-process.on('SIGINT', () => {
+process.on('SIGINT', async () => {
   console.log('\n🛑 Shutting down gracefully...');
   io.close(() => {
     console.log('🔌 WebSocket server closed');
@@ -712,19 +1095,27 @@ process.on('SIGINT', () => {
   if (mqttClient) {
     mqttClient.end();
   }
+  if (mongoConnected) {
+    await mongoose.connection.close();
+    console.log('🗄️  MongoDB connection closed');
+  }
   httpServer.close(() => {
     console.log('🚪 HTTP server closed');
     process.exit(0);
   });
 });
 
-process.on('SIGTERM', () => {
+process.on('SIGTERM', async () => {
   console.log('\n🛑 Received SIGTERM, shutting down...');
   io.close(() => {
     console.log('🔌 WebSocket server closed');
   });
   if (mqttClient) {
     mqttClient.end();
+  }
+  if (mongoConnected) {
+    await mongoose.connection.close();
+    console.log('🗄️  MongoDB connection closed');
   }
   httpServer.close(() => {
     console.log('🚪 HTTP server closed');
