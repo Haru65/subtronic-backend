@@ -130,13 +130,19 @@ io.on('connection', (socket) => {
   socket.on('subscribe:device', (deviceId) => {
     console.log(`📡 Client ${socket.id} subscribed to device ${deviceId}`);
     socket.join(`device:${deviceId}`);
+    console.log(`✅ Client ${socket.id} joined room device:${deviceId}`);
     
-    // Send current data immediately
+    // Send current data immediately if available
     if (subtronicsData.has(deviceId)) {
+      const currentData = subtronicsData.get(deviceId);
+      console.log(`📤 Sending current data to ${socket.id} for device ${deviceId}:`, currentData);
       socket.emit('device:data', {
         deviceId,
-        data: subtronicsData.get(deviceId)
+        data: currentData,
+        timestamp: new Date().toISOString()
       });
+    } else {
+      console.log(`⚠️  No current data available for device ${deviceId}`);
     }
   });
   
@@ -488,7 +494,7 @@ if (mqttClient) {
   mqttClient.on('message', (topic, message) => {
     try {
       const data = JSON.parse(message.toString());
-      console.log(`📨 Received on ${topic}:`, data);
+      console.log(`📨 Received MQTT message on ${topic}:`, JSON.stringify(data).substring(0, 200));
       
       // Handle Subtronics Gas Monitor data
       if (topic === 'SubTronics/data') {
@@ -498,17 +504,28 @@ if (mqttClient) {
           // Use serial number as device ID
           const deviceId = normalized.serial_number;
           
+          console.log(`🔍 Processing Subtronics data for device: ${deviceId}`);
+          
           // Store normalized data
           subtronicsData.set(deviceId, normalized);
+          console.log(`💾 Stored Subtronics data in memory for device ${deviceId}`);
           
           // Broadcast to all connected WebSocket clients subscribed to this device
+          console.log(`🔊 Broadcasting to room: device:${deviceId}`);
           io.to(`device:${deviceId}`).emit('device:data', {
             deviceId,
             data: normalized,
             timestamp: new Date().toISOString()
           });
           
-          console.log(`💾 Stored and broadcasted Subtronics data for device ${deviceId} to ${connectedClients} clients`);
+          // Also broadcast to all clients for debugging
+          io.emit('subtronics:data', {
+            deviceId,
+            data: normalized,
+            timestamp: new Date().toISOString()
+          });
+          
+          console.log(`✅ Broadcasted Subtronics data for device ${deviceId} to ${connectedClients} total clients`);
           
           // Generate alerts
           const alerts = generateSubtronicsAlerts(normalized);
