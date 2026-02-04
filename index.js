@@ -43,18 +43,28 @@ const httpServer = createServer(app);
 // Initialize Socket.IO with CORS
 const io = new Server(httpServer, {
   cors: {
-    origin: process.env.ALLOWED_ORIGINS 
-      ? process.env.ALLOWED_ORIGINS.split(',')
-      : [
-          'http://localhost:3001',
-          'http://localhost:3000',
-          'http://localhost:5173',
-          'http://localhost:5174',
-          'http://127.0.0.1:5173',
-          'http://127.0.0.1:5174',
-          'https://subtronic-frontend.vercel.app',
-          'https://*.vercel.app'
-        ],
+    origin: function (origin, callback) {
+      // Allow all Vercel preview deployments
+      if (!origin || origin.includes('vercel.app')) {
+        return callback(null, true);
+      }
+      
+      // List of allowed local origins
+      const allowedOrigins = [
+        'http://localhost:3001',
+        'http://localhost:3000',
+        'http://localhost:5173',
+        'http://localhost:5174',
+        'http://127.0.0.1:5173',
+        'http://127.0.0.1:5174'
+      ];
+      
+      if (allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+      
+      return callback(null, false);
+    },
     credentials: true,
     methods: ['GET', 'POST']
   },
@@ -62,9 +72,10 @@ const io = new Server(httpServer, {
 });
 
 // CORS configuration to allow both local and Vercel frontend
-const allowedOrigins = process.env.ALLOWED_ORIGINS 
-  ? process.env.ALLOWED_ORIGINS.split(',')
-  : [
+const corsOptions = {
+  origin: function (origin, callback) {
+    // List of allowed origins
+    const allowedOrigins = [
       'http://localhost:3001',
       'http://localhost:3000',
       'http://localhost:5173',
@@ -73,11 +84,29 @@ const allowedOrigins = process.env.ALLOWED_ORIGINS
       'http://127.0.0.1:5174',
       'https://subtronic-frontend.vercel.app'
     ];
-
-const corsOptions = {
-  origin: allowedOrigins,
+    
+    // Allow from environment variable if set
+    if (process.env.ALLOWED_ORIGINS) {
+      allowedOrigins.push(...process.env.ALLOWED_ORIGINS.split(','));
+    }
+    
+    // Allow all Vercel preview deployments
+    if (!origin || origin.includes('vercel.app')) {
+      return callback(null, true);
+    }
+    
+    // Check if origin is in allowed list
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    
+    // Log blocked origins for debugging
+    console.log('⚠️ CORS blocked origin:', origin);
+    return callback(new Error('CORS not allowed'), false);
+  },
   credentials: true,
-  optionsSuccessStatus: 200
+  optionsSuccessStatus: 200,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH']
 };
 
 app.use(cors(corsOptions));
