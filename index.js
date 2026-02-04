@@ -1202,6 +1202,109 @@ httpServer.listen(HTTP_PORT, () => {
   console.log(`🔌 WebSocket: ws://localhost:${HTTP_PORT}`);
   console.log(`🧪 Test Subtronics: POST http://localhost:${HTTP_PORT}/test/subtronics/123`);
   console.log(`📊 Subtronics API: GET http://localhost:${HTTP_PORT}/devices/123/subtronics/telemetry/latest`);
+  
+  // Initialize with test devices
+  const testDevices = [
+    {
+      serial_number: 'OTSM-0114',
+      device_name: 'Gas Sensor Block1',
+      gas_type: 'Carbon Monoxide (CO)',
+      timestamp: new Date().toISOString().replace('T', ' ').substring(0, 19),
+      unit: 'ppm',
+      message_type: 'LOG DATA',
+      sender: 'Device',
+      sensor_reading: 150,
+      alarm_status: 'NORMAL',
+      offset: 0,
+      span_high: 2000,
+      span_low: 0,
+      a1_level: 250,
+      a2_level: 500,
+      a3_level: 1000,
+      decimal_point: 0,
+      a1_type: 'High',
+      a1_hysteresis: 0,
+      a1_latching: 0,
+      a1_siren: 0,
+      a1_buzzer: 0,
+      alarm1_led: 0,
+      alarm2_led: 0,
+      alarm3_led: 0,
+      sensor_fault: 0,
+      latitude: '19.0760',
+      longitude: '72.8777',
+      processed_at: new Date().toISOString(),
+      data_quality: 'good'
+    },
+    {
+      serial_number: 'OTSM-0115',
+      device_name: 'Gas Sensor Block2',
+      gas_type: 'Carbon Monoxide (CO)',
+      timestamp: new Date().toISOString().replace('T', ' ').substring(0, 19),
+      unit: 'ppm',
+      message_type: 'LOG DATA',
+      sender: 'Device',
+      sensor_reading: 75,
+      alarm_status: 'NORMAL',
+      offset: 0,
+      span_high: 2000,
+      span_low: 0,
+      a1_level: 250,
+      a2_level: 500,
+      a3_level: 1000,
+      decimal_point: 0,
+      a1_type: 'High',
+      a1_hysteresis: 0,
+      a1_latching: 0,
+      a1_siren: 0,
+      a1_buzzer: 0,
+      alarm1_led: 0,
+      alarm2_led: 0,
+      alarm3_led: 0,
+      sensor_fault: 0,
+      latitude: '19.0761',
+      longitude: '72.8778',
+      processed_at: new Date().toISOString(),
+      data_quality: 'good'
+    },
+    {
+      serial_number: 'OTSM-0116',
+      device_name: 'Gas Sensor Block3',
+      gas_type: 'Carbon Monoxide (CO)',
+      timestamp: new Date().toISOString().replace('T', ' ').substring(0, 19),
+      unit: 'ppm',
+      message_type: 'LOG DATA',
+      sender: 'Device',
+      sensor_reading: 320,
+      alarm_status: 'ALARM_1',
+      offset: 0,
+      span_high: 2000,
+      span_low: 0,
+      a1_level: 250,
+      a2_level: 500,
+      a3_level: 1000,
+      decimal_point: 0,
+      a1_type: 'High',
+      a1_hysteresis: 0,
+      a1_latching: 0,
+      a1_siren: 1,
+      a1_buzzer: 1,
+      alarm1_led: 1,
+      alarm2_led: 0,
+      alarm3_led: 0,
+      sensor_fault: 0,
+      latitude: '19.0762',
+      longitude: '72.8779',
+      processed_at: new Date().toISOString(),
+      data_quality: 'good'
+    }
+  ];
+  
+  // Store test devices in memory
+  testDevices.forEach(device => {
+    subtronicsData.set(device.serial_number, device);
+    console.log(`📦 Initialized test device: ${device.serial_number} (${device.device_name})`);
+  });
 });
 
 // Graceful shutdown
