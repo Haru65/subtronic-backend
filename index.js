@@ -40,6 +40,22 @@ const MQTT_TOPICS = {
 const app = express();
 const httpServer = createServer(app);
 
+// Define allowed origins list
+const ALLOWED_ORIGINS_LIST = [
+  'http://localhost:3001',
+  'http://localhost:3000',
+  'http://localhost:5173',
+  'http://localhost:5174',
+  'http://127.0.0.1:5173',
+  'http://127.0.0.1:5174',
+  'https://subtronic-frontend.vercel.app'
+];
+
+// Add from environment variable if set
+if (process.env.ALLOWED_ORIGINS) {
+  ALLOWED_ORIGINS_LIST.push(...process.env.ALLOWED_ORIGINS.split(','));
+}
+
 // Initialize Socket.IO with CORS
 const io = new Server(httpServer, {
   cors: {
@@ -49,17 +65,7 @@ const io = new Server(httpServer, {
         return callback(null, true);
       }
       
-      // List of allowed local origins
-      const allowedOrigins = [
-        'http://localhost:3001',
-        'http://localhost:3000',
-        'http://localhost:5173',
-        'http://localhost:5174',
-        'http://127.0.0.1:5173',
-        'http://127.0.0.1:5174'
-      ];
-      
-      if (allowedOrigins.includes(origin)) {
+      if (ALLOWED_ORIGINS_LIST.includes(origin)) {
         return callback(null, true);
       }
       
@@ -74,29 +80,13 @@ const io = new Server(httpServer, {
 // CORS configuration to allow both local and Vercel frontend
 const corsOptions = {
   origin: function (origin, callback) {
-    // List of allowed origins
-    const allowedOrigins = [
-      'http://localhost:3001',
-      'http://localhost:3000',
-      'http://localhost:5173',
-      'http://localhost:5174',
-      'http://127.0.0.1:5173',
-      'http://127.0.0.1:5174',
-      'https://subtronic-frontend.vercel.app'
-    ];
-    
-    // Allow from environment variable if set
-    if (process.env.ALLOWED_ORIGINS) {
-      allowedOrigins.push(...process.env.ALLOWED_ORIGINS.split(','));
-    }
-    
     // Allow all Vercel preview deployments
     if (!origin || origin.includes('vercel.app')) {
       return callback(null, true);
     }
     
     // Check if origin is in allowed list
-    if (allowedOrigins.includes(origin)) {
+    if (ALLOWED_ORIGINS_LIST.includes(origin)) {
       return callback(null, true);
     }
     
@@ -107,7 +97,7 @@ const corsOptions = {
   credentials: true,
   optionsSuccessStatus: 200,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Internal-Request-ID', 'X-Request-ID']
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Internal-Request-ID', 'X-Request-ID', 'x-internal-request-id']
 };
 
 app.use(cors(corsOptions));
@@ -991,6 +981,87 @@ app.post('/subtronic/devices/:deviceId/commands', (req, res) => {
   }
 });
 
+// Get all devices
+app.get('/api/devices', (req, res) => {
+  try {
+    const devices = [];
+    
+    // Add all subtronics devices
+    for (const [deviceId, deviceData] of subtronicsData.entries()) {
+      if (!deviceId.endsWith('_alerts')) {
+        devices.push({
+          id: deviceId,
+          device_id: deviceId,
+          name: deviceData.device_name || `Device ${deviceId}`,
+          type: 'subtronics_gas_monitor',
+          status: deviceData.alarm_status || 'NORMAL',
+          last_update: deviceData.processed_at || new Date().toISOString(),
+          data: deviceData
+        });
+      }
+    }
+    
+    res.json({
+      success: true,
+      count: devices.length,
+      devices: devices
+    });
+    console.log(`📤 Sent ${devices.length} devices`);
+  } catch (error) {
+    console.error('❌ Error fetching devices:', error);
+    res.status(500).json({ error: 'Failed to fetch devices', details: error.message });
+  }
+});
+
+// Get single device details
+app.get('/api/devices/:deviceId', (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    
+    if (subtronicsData.has(deviceId)) {
+      const data = subtronicsData.get(deviceId);
+      res.json({
+        success: true,
+        id: deviceId,
+        device_id: deviceId,
+        name: data.device_name || `Device ${deviceId}`,
+        type: 'subtronics_gas_monitor',
+        status: data.alarm_status || 'NORMAL',
+        last_update: data.processed_at || new Date().toISOString(),
+        data: data
+      });
+      console.log(`📤 Sent device details for ${deviceId}`);
+    } else {
+      // Return mock data
+      const mockData = {
+        device_name: "Gas Sensor Block1",
+        serial_number: deviceId,
+        gas_type: "Carbon Monoxide (CO)",
+        timestamp: new Date().toISOString().replace('T', ' ').substring(0, 19),
+        unit: "ppm",
+        sensor_reading: 0,
+        alarm_status: "NORMAL"
+      };
+      subtronicsData.set(deviceId, mockData);
+      
+      res.json({
+        success: true,
+        id: deviceId,
+        device_id: deviceId,
+        name: mockData.device_name,
+        type: 'subtronics_gas_monitor',
+        status: 'NORMAL',
+        last_update: new Date().toISOString(),
+        data: mockData
+      });
+      console.log(`📤 Sent mock device details for ${deviceId}`);
+    }
+  } catch (error) {
+    console.error('❌ Error fetching device:', error);
+    res.status(500).json({ error: 'Failed to fetch device', details: error.message });
+  }
+});
+
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({
@@ -1000,7 +1071,7 @@ app.get('/health', (req, res) => {
     devices_count: deviceData.size,
     subtronics_devices: subtronicsData.size,
     pending_commands: pendingCommands.size,
-    allowed_origins: allowedOrigins,
+    allowed_origins: ALLOWED_ORIGINS_LIST,
     timestamp: new Date().toISOString()
   });
 });
